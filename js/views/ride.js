@@ -8,6 +8,7 @@ import {
   haversine, compass, makeMap, dropMap, dot, icon, meta, sparkline, fileSafe,
 } from '../ui.js';
 import { sensor, startSensors, stopSensors, recalibrate } from '../sensors.js';
+import { isNative, watchPosition, clearWatch } from '../geo.js';
 
 export const title = 'Ride';
 
@@ -38,20 +39,20 @@ const say = (text) => { if (S.voice) speak(text); };
 
 function ensureWatch() {
   if (T.watchId != null) return;
-  if (!('geolocation' in navigator)) { T.gpsMsg = 'This browser has no access to GPS.'; return; }
+  if (!isNative && !('geolocation' in navigator)) { T.gpsMsg = 'This browser has no access to GPS.'; return; }
   T.gpsMsg = 'Waiting for GPS signal…';
-  T.watchId = navigator.geolocation.watchPosition(onPos, onGpsError, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
+  T.watchId = watchPosition(onPos, onGpsError);
 }
 
 function stopWatch() {
-  if (T.watchId != null) navigator.geolocation.clearWatch(T.watchId);
+  clearWatch(T.watchId);
   T.watchId = null;
   T.speed = null;
 }
 
 function onGpsError(e) {
   T.gpsMsg = e.code === 1
-    ? 'Location is switched off for this app. Allow it in iPhone Settings, then try again.'
+    ? `Location is switched off for this app. Allow it in iPhone Settings${isNative ? ' (Location: While Using, Precise on)' : ''}, then try again.`
     : 'Waiting for GPS signal…';
   T.speed = null;
   paint();
@@ -615,7 +616,9 @@ export async function render(el) {
     <button class="btn huge block mb ${T.active ? '' : 'primary'}" data-act="toggle">${T.active ? 'Stop and save ride' : 'Start ride'}</button>
     ${
       T.active
-        ? `<p class="muted small mb">Keep this screen open while riding: iPhone pauses GPS for web apps when the screen locks. Lean and G-force are only meaningful with the phone fixed in a mount. ${
+        ? `<p class="muted small mb">${isNative
+            ? 'GPS keeps recording with the screen locked (the status bar turns blue). Lean and G-force pause while the screen is off.'
+            : 'Keep this screen open while riding: iPhone pauses GPS for web apps when the screen locks.'} Lean and G-force are only meaningful with the phone fixed in a mount. ${
             S.sensors ? '<button class="btn sm" data-act="zero" style="margin-top:6px">Set lean to zero (bike upright)</button>' : ''
           }</p>`
         : ''

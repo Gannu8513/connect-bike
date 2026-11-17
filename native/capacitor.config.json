@@ -1,0 +1,9 @@
+{
+  "appId": "com.connectbike.app",
+  "appName": "Connect Bike",
+  "webDir": "www",
+  "ios": {
+    "contentInset": "never",
+    "backgroundColor": "#0e1b1d"
+  }
+}

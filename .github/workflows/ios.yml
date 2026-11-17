@@ -1,0 +1,87 @@
+name: iOS app
+
+# Builds an unsigned .ipa on a macOS runner. Install it with AltStore or SideStore,
+# which sign it with your own Apple ID.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - 'js/**'
+      - 'css/**'
+      - 'vendor/**'
+      - 'icons/**'
+      - 'native/**'
+      - '.github/workflows/ios.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Create the Xcode project
+        working-directory: native
+        run: |
+          npm ci
+          node copy-web.mjs
+          npx cap add ios
+
+      - name: Permissions, background GPS and icon
+        working-directory: native/ios/App/App
+        run: |
+          P=Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSLocationWhenInUseUsageDescription string 'Your location is used to record rides, navigate and remember where the bike is parked.'" $P
+          /usr/libexec/PlistBuddy -c "Add :NSLocationAlwaysAndWhenInUseUsageDescription string 'Your location is used to keep recording a ride while the screen is locked.'" $P
+          /usr/libexec/PlistBuddy -c "Add :NSMotionUsageDescription string 'Motion sensors are used to show lean angle and G-force during a ride.'" $P
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" $P
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string location" $P
+          /usr/libexec/PlistBuddy -c "Delete :UIRequiredDeviceCapabilities" $P
+          sips -z 1024 1024 ../../../../icons/icon-512.png --out Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png
+
+      - name: Build
+        working-directory: native/ios/App
+        run: |
+          xcodebuild -project App.xcodeproj -scheme App -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            MARKETING_VERSION=1.0 CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            build | tail -n 40
+          test -d build/Build/Products/Release-iphoneos/App.app
+
+      - name: Package .ipa
+        run: |
+          mkdir Payload
+          cp -R native/ios/App/build/Build/Products/Release-iphoneos/App.app Payload/
+          zip -qry ConnectBike.ipa Payload
+          ls -lh ConnectBike.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ConnectBike-ipa
+          path: ConnectBike.ipa
+
+      - name: Publish to the "ios-latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete ios-latest --yes --cleanup-tag || true
+          gh release create ios-latest ConnectBike.ipa --prerelease \
+            --title "iPhone app (latest build)" \
+            --notes "Build ${{ github.run_number }} from ${GITHUB_SHA::7}. Install with AltStore or SideStore."
