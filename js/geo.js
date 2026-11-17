@@ -3,7 +3,8 @@
 
 const cap = window.Capacitor;
 export const isNative = !!cap?.isNativePlatform?.();
-const BG = isNative ? cap.registerPlugin('BackgroundGeolocation') : null;
+// If the plugin can't be set up, fall back to web GPS rather than failing the whole app at load.
+const BG = isNative && typeof cap.registerPlugin === 'function' ? cap.registerPlugin('BackgroundGeolocation') : null;
 
 /**
  * Starts watching the position. onPos receives a web-style position ({ coords, timestamp });
