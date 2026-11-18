@@ -16,8 +16,9 @@ import * as trips from './views/trips.js';
 import * as parking from './views/parking.js';
 import * as odometer from './views/odometer.js';
 import * as backup from './views/backup.js';
+import * as blebike from './views/blebike.js';
 
-const views = { home, ride, fuel, service, money, bike, profile, docs, checklist, emergency, stats, trips, parking, odometer, backup };
+const views = { home, ride, fuel, service, money, bike, profile, docs, checklist, emergency, stats, trips, parking, odometer, backup, blebike };
 const TABS = ['home', 'ride', 'fuel', 'service', 'money'];
 const viewEl = document.getElementById('view');
 let currentName = null;

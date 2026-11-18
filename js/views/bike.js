@@ -15,6 +15,7 @@ const MENU = [
   ['emergency', 'cross', 'Emergency'],
   ['profile', 'bike', 'Bike profile'],
   ['backup', 'cloud', 'Backup and sync'],
+  ['blebike', 'bluetooth', 'Bike Bluetooth'],
 ];
 
 export async function render(el) {

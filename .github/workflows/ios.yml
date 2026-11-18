@@ -49,6 +49,7 @@ jobs:
           P=Info.plist
           /usr/libexec/PlistBuddy -c "Add :NSLocationWhenInUseUsageDescription string 'Your location is used to record rides, navigate and remember where the bike is parked.'" $P
           /usr/libexec/PlistBuddy -c "Add :NSLocationAlwaysAndWhenInUseUsageDescription string 'Your location is used to keep recording a ride while the screen is locked.'" $P
+          /usr/libexec/PlistBuddy -c "Add :NSBluetoothAlwaysUsageDescription string 'Bluetooth is used to read information from your bike.'" $P
           /usr/libexec/PlistBuddy -c "Add :NSMotionUsageDescription string 'Motion sensors are used to show lean angle and G-force during a ride.'" $P
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" $P
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string location" $P
