@@ -1,5 +1,6 @@
 import { seed, getSettings } from './data.js';
 import { startAutoSync } from './sync.js';
+import { startBikeCapture } from './bikeble.js';
 import { openPhotos } from './photos.js';
 import * as home from './views/home.js';
 import * as ride from './views/ride.js';
@@ -83,4 +84,5 @@ viewEl.addEventListener('click', (e) => {
   navigator.storage?.persist?.().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   startAutoSync();
+  startBikeCapture().catch((e) => console.error(e));
 })();

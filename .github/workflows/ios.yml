@@ -53,6 +53,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :NSMotionUsageDescription string 'Motion sensors are used to show lean angle and G-force during a ride.'" $P
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" $P
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string location" $P
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:1 string bluetooth-central" $P
           /usr/libexec/PlistBuddy -c "Delete :UIRequiredDeviceCapabilities" $P
           sips -z 1024 1024 ../../../../icons/icon-512.png --out Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png
 

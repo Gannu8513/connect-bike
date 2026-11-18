@@ -1,5 +1,5 @@
 // Offline support: network first (so updates arrive immediately), cached copy when offline.
-const CACHE = 'bike-companion-v6';
+const CACHE = 'bike-companion-v7';
 const ASSETS = [
   './',
   'index.html',
@@ -11,6 +11,7 @@ const ASSETS = [
   'js/ui.js',
   'js/sensors.js',
   'js/geo.js',
+  'js/bikeble.js',
   'js/sync.js',
   'js/photos.js',
   'js/report.js',
