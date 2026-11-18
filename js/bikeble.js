@@ -1,20 +1,24 @@
-// Automatic, read-only capture from the bike's Bluetooth unit ("HONDA BTU ...").
-// While the iPhone app is open (or kept alive in the background by GPS during a capture) it:
-//   finds the bike and connects on its own, reads every readable value, listens to every
-//   notify channel, re-reads every 2 s logging only changes, logs GPS speed alongside so the
-//   data can be matched to riding, reconnects when the bike comes back, and uploads the log
-//   to the owner's sync gist. It never writes to the bike (only the standard switch that
-//   turns notifications on).
+// Automatic, read-only capture of everything the bike's Bluetooth unit ("HONDA BTU ...") offers,
+// logged side by side with what the phone itself measures (GPS and motion sensors), so it is
+// clear which data comes from the bike and what changes when.
+//
+// While the iPhone app is open (and with the screen locked once GPS is running) it:
+//   finds the bike and connects on its own; records its advertising data; reads every value and
+//   every descriptor; listens to every notify channel; re-reads values every 2 s (logging only
+//   changes); logs signal strength, full GPS and motion; reconnects when the bike comes back;
+//   builds a summary of what each bike channel sent; uploads the log to the owner's sync gist.
+// It never writes to the bike (only the standard switch that turns notifications on).
 import { db } from './db.js';
 import { isNative, watchPosition, clearWatch } from './geo.js';
 import { getSync } from './sync.js';
 
 export const HONDA_SERVICE = '4d87b1ea-528b-4798-b002-e2e1442a2e86';
 const LOG_KEY = 'bleLog';
+const STATS_KEY = 'bleStats';
 const SKIP_KEY = 'bleSkip'; // reads that needed pairing; not retried automatically (avoids repeated iOS prompts)
 const AUTO_KEY = 'bleAuto';
 const LOG_FILE = 'bike-bluetooth-log.txt';
-const MAX_LOG = 20000;
+const MAX_LOG = 30000;
 const cap = window.Capacitor;
 export const BLE = isNative && typeof cap.registerPlugin === 'function' ? cap.registerPlugin('BluetoothLe') : null;
 
@@ -23,6 +27,7 @@ const KNOWN = {
   '2a00': 'Device Name', '2a01': 'Appearance', '2a04': 'Connection Parameters', '2a05': 'Service Changed',
   '2a29': 'Manufacturer', '2a24': 'Model Number', '2a25': 'Serial Number', '2a27': 'Hardware Revision',
   '2a26': 'Firmware Revision', '2a28': 'Software Revision', '2a23': 'System ID', '2a50': 'PnP ID', '2a19': 'Battery Level',
+  '2900': 'Extended Properties', '2901': 'User Description', '2902': 'Notify Switch (CCCD)', '2904': 'Presentation Format',
 };
 export const short = (u) => (u.endsWith('-0000-1000-8000-00805f9b34fb') && u.startsWith('0000') ? u.slice(4, 8) : u);
 export const label = (u) => KNOWN[short(u)] || short(u).slice(0, 8).toUpperCase();
@@ -31,15 +36,19 @@ export const ascii = (h) => (h || '').replace(/(..)/g, (b) => { const c = parseI
 const errText = (e) => String(e?.message || e || 'unknown error');
 const stamp = () => { const d = new Date(); return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0'); };
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const f = (n, d = 1) => (n == null || Number.isNaN(n) ? '?' : Number(n).toFixed(d));
 
 /** Shared state, read by the Bike Bluetooth screen. */
 export const S = {
   auto: true,
   phase: 'off', // off | searching | connecting | connected
   dev: null, // { deviceId, name }
-  chars: [], // { svc, uuid, props, value, count, err }
+  chars: [], // { svc, uuid, props, value, count, err, desc: {uuid: text} }
   log: [],
-  speed: null,
+  stats: {}, // per characteristic uuid, kept across sessions (see note())
+  gps: null, // last { lat, lon, alt, kmh, heading, acc }
+  motion: false, // motion sensors reporting
+  rssi: null,
   lastUpload: null, // { at, ok, msg }
   gistId: null,
 };
@@ -48,6 +57,7 @@ let started = false;
 let scanListener = null;
 let connListeners = [];
 let pollTimer = null;
+let rssiTimer = null;
 let idleTimer = null;
 let gpsWatch = null;
 let lastGpsLog = 0;
@@ -62,15 +72,52 @@ export function log(line) {
   S.log.push(`${new Date().toISOString().slice(0, 10)} ${stamp()} ${line}`);
   if (S.log.length > MAX_LOG) S.log.splice(0, S.log.length - MAX_LOG);
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => db.kvSet(LOG_KEY, S.log).catch(() => {}), 1000);
+  saveTimer = setTimeout(() => {
+    db.kvSet(LOG_KEY, S.log).catch(() => {});
+    db.kvSet(STATS_KEY, S.stats).catch(() => {});
+  }, 1000);
   changed();
 }
 
 export function clearLog() {
   S.log = [];
+  S.stats = {};
   uploadedLen = -1;
   db.kvSet(LOG_KEY, []).catch(() => {});
+  db.kvSet(STATS_KEY, {}).catch(() => {});
   changed();
+}
+
+/* ---------- summary: what each bike channel has sent ---------- */
+
+/** Records a value seen on a characteristic (kind: read | notify). */
+function note(c, kind, hex) {
+  const st = (S.stats[c.uuid] ||= {
+    name: label(c.uuid), svc: c.svc, props: Object.keys(c.props).filter((k) => c.props[k]),
+    reads: 0, notifies: 0, distinct: [], lengths: [], changingBytes: [], first: Date.now(), last: null, lastValue: null,
+  });
+  st[kind === 'read' ? 'reads' : 'notifies']++;
+  st.last = Date.now();
+  if (st.lastValue != null && st.lastValue !== hex) {
+    const a = st.lastValue.match(/../g) || [], b = hex.match(/../g) || [];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) if (a[i] !== b[i] && !st.changingBytes.includes(i)) st.changingBytes.push(i);
+    st.changingBytes.sort((x, y) => x - y);
+  }
+  st.lastValue = hex;
+  if (st.distinct.length < 40 && !st.distinct.includes(hex)) st.distinct.push(hex);
+  const len = hex.length / 2;
+  if (!st.lengths.includes(len)) st.lengths.push(len);
+}
+
+export function summaryText() {
+  const rows = Object.entries(S.stats);
+  if (!rows.length) return 'Nothing received from the bike yet.';
+  return rows.map(([uuid, st]) => [
+    `${st.name}  (${uuid})  [${st.props.join(', ')}]`,
+    `   reads ${st.reads}, live updates ${st.notifies}, distinct values ${st.distinct.length}${st.distinct.length >= 40 ? '+' : ''}, lengths ${st.lengths.join('/')} bytes`,
+    `   ${st.changingBytes.length ? 'bytes that change: ' + st.changingBytes.join(', ') : 'never changed'}`,
+    `   last: ${hexSp(st.lastValue) || '(empty)'}  |${ascii(st.lastValue)}|`,
+  ].join('\n')).join('\n');
 }
 
 export function logText() {
@@ -78,8 +125,13 @@ export function logText() {
     'Connect Bike - Bike Bluetooth log (automatic capture)',
     `Saved ${new Date().toString()}`,
     S.dev ? `Device ${S.dev.name} (${S.dev.deviceId})` : '',
+    'Lines: BIKE = from the motorcycle. PHONE GPS / PHONE MOTION = measured by the iPhone itself.',
     '',
-  ].join('\n') + S.log.join('\n') + '\n';
+    '===== SUMMARY: what the bike has sent =====',
+    summaryText(),
+    '',
+    '===== FULL LOG =====',
+  ].join('\n') + '\n' + S.log.join('\n') + '\n';
 }
 
 /* ---------- finding the bike ---------- */
@@ -93,9 +145,9 @@ async function startSearch() {
       scanListener = await BLE.addListener('onScanResult', (r) => {
         const id = r.device?.deviceId;
         if (!id || S.phase !== 'searching') return;
-        log(`Found ${r.localName || r.device.name || id} (signal ${r.rssi} dBm)` +
-          (r.manufacturerData && Object.keys(r.manufacturerData).length ? ` manufacturer data ${JSON.stringify(r.manufacturerData)}` : '') +
-          (r.serviceData && Object.keys(r.serviceData).length ? ` service data ${JSON.stringify(r.serviceData)}` : ''));
+        log(`BIKE ADVERT ${r.localName || r.device.name || id}: signal ${r.rssi} dBm, tx power ${r.txPower ?? '?'}, ` +
+          `services ${(r.uuids || []).join(' ') || 'none'}, manufacturer data ${JSON.stringify(r.manufacturerData || {})}, ` +
+          `service data ${JSON.stringify(r.serviceData || {})}`);
         connect(id, r.localName || r.device.name);
       });
     }
@@ -116,7 +168,7 @@ async function checkAlreadyConnected() {
   try {
     const { devices } = await BLE.getConnectedDevices({ services: [HONDA_SERVICE] });
     if (devices?.length) {
-      log(`Bike already connected to the iPhone: ${devices[0].name || devices[0].deviceId}`);
+      log(`Bike already connected to the iPhone (probably by Honda's app): ${devices[0].name || devices[0].deviceId}`);
       connect(devices[0].deviceId, devices[0].name);
     }
   } catch { /* try again later */ }
@@ -143,23 +195,26 @@ async function connect(deviceId, name) {
     await BLE.connect({ deviceId, timeout: 20000 });
     S.phase = 'connected';
     log('Connected.');
-    try { log(`MTU ${(await BLE.getMtu({ deviceId })).value}`); } catch { /* not important */ }
+    try { log(`BIKE MTU ${(await BLE.getMtu({ deviceId })).value}`); } catch { /* not important */ }
 
     const { services } = await BLE.getServices({ deviceId });
     for (const s of services) {
       log(`SERVICE ${s.uuid} (${label(s.uuid)})`);
       for (const c of s.characteristics) {
         const props = Object.entries(c.properties).filter(([, v]) => v).map(([k]) => k);
-        log(`  CHAR ${c.uuid} (${label(c.uuid)}) [${props.join(', ')}]`);
-        S.chars.push({ svc: s.uuid, uuid: c.uuid, props: c.properties, value: null, count: 0, err: null });
+        log(`  CHAR ${c.uuid} (${label(c.uuid)}) [${props.join(', ')}]${c.descriptors?.length ? ' descriptors: ' + c.descriptors.map((d) => label(d.uuid)).join(', ') : ''}`);
+        S.chars.push({ svc: s.uuid, uuid: c.uuid, props: c.properties, descriptors: c.descriptors || [], value: null, count: 0, err: null, desc: {} });
       }
     }
+    await readDescriptors();
     if (skip.size) log(`Not reading ${skip.size} locked value(s) found earlier, to avoid pairing prompts.`);
     await readAll('first read');
     await subscribeAll();
-    log('Capturing. Readable values are re-read every 2 s (only changes are logged); GPS speed is logged alongside.');
+    log('Capturing everything. Values re-read every 2 s (only changes logged), signal every 5 s, GPS and motion every 2 s.');
     pollTimer = setInterval(() => readAll('auto'), 2000);
+    rssiTimer = setInterval(readRssi, 5000);
     startGps();
+    startMotion();
   } catch (e) {
     log('Connect failed: ' + errText(e) + '. Will try again.');
     await BLE.disconnect({ deviceId }).catch(() => {});
@@ -180,34 +235,64 @@ async function onDisconnected() {
 
 async function endSession() {
   clearInterval(pollTimer);
-  pollTimer = null;
+  clearInterval(rssiTimer);
+  pollTimer = rssiTimer = null;
   stopGps();
+  stopMotion();
   const ls = connListeners.splice(0);
   await Promise.all(ls.map((h) => h.remove?.().catch(() => {})));
   S.phase = 'off';
-  S.speed = null;
+  S.rssi = null;
   changed();
 }
 
+/** Descriptor labels (e.g. a "User Description" naming the value). iOS manages the notify switch itself. */
+async function readDescriptors() {
+  for (const c of S.chars) {
+    for (const d of c.descriptors) {
+      if (short(d.uuid) === '2902') continue;
+      try {
+        const { value } = await BLE.readDescriptor({ deviceId: S.dev.deviceId, service: c.svc, characteristic: c.uuid, descriptor: d.uuid, timeout: 4000 });
+        c.desc[d.uuid] = value;
+        log(`BIKE DESCRIPTOR ${label(c.uuid)} / ${label(d.uuid)} = ${hexSp(value) || '(empty)'}  |${ascii(value)}|`);
+      } catch (e) {
+        log(`BIKE DESCRIPTOR ${label(c.uuid)} / ${label(d.uuid)} failed: ${errText(e)}`);
+      }
+    }
+  }
+}
+
+async function readRssi() {
+  if (S.phase !== 'connected') return;
+  try {
+    const { value } = await BLE.readRssi({ deviceId: S.dev.deviceId });
+    S.rssi = value;
+    log(`BIKE SIGNAL ${value} dBm`);
+  } catch { /* not important */ }
+}
+
 let reading = false;
-export async function readAll(why, includeSkipped = false) {
+/** Reads every readable value. includeLocked retries ones that needed pairing (may show an iOS prompt). */
+export async function readAll(why, includeLocked = false) {
   if (S.phase !== 'connected' || reading) return;
   reading = true;
   if (why !== 'auto') log(`--- reading all values (${why}) ---`);
   try {
     for (const c of S.chars.filter((x) => x.props.read)) {
       if (S.phase !== 'connected') break;
-      if (!includeSkipped && skip.has(c.uuid)) continue;
+      if (!includeLocked && skip.has(c.uuid)) continue;
       try {
         const { value } = await BLE.read({ deviceId: S.dev.deviceId, service: c.svc, characteristic: c.uuid, timeout: 5000 });
         const diff = c.value !== null && c.value !== value;
         c.value = value; c.err = null;
-        if (why !== 'auto' || diff) log(`READ ${label(c.uuid)} = ${hexSp(value) || '(empty)'}  |${ascii(value)}|${diff ? '  CHANGED' : ''}`);
+        note(c, 'read', value);
+        if (skip.delete(c.uuid)) db.kvSet(SKIP_KEY, [...skip]).catch(() => {});
+        if (why !== 'auto' || diff) log(`BIKE READ ${label(c.uuid)} = ${hexSp(value) || '(empty)'}  |${ascii(value)}|${diff ? '  CHANGED' : ''}`);
       } catch (e) {
         const msg = errText(e);
-        if (c.err !== msg || why !== 'auto') log(`READ ${label(c.uuid)} failed: ${msg}`);
+        if (c.err !== msg || why !== 'auto') log(`BIKE READ ${label(c.uuid)} failed: ${msg}`);
         c.err = msg;
-        if (/auth|encrypt|pair|permit|not permitted/i.test(msg) && !skip.has(c.uuid)) {
+        if (/auth|encrypt|pair|permit/i.test(msg) && !skip.has(c.uuid)) {
           skip.add(c.uuid);
           db.kvSet(SKIP_KEY, [...skip]).catch(() => {});
           log(`  (${label(c.uuid)} is locked; it will not be re-read automatically)`);
@@ -219,6 +304,7 @@ export async function readAll(why, includeSkipped = false) {
     changed();
   }
 }
+export const lockedCount = () => skip.size;
 
 async function subscribeAll() {
   const { deviceId } = S.dev;
@@ -226,7 +312,8 @@ async function subscribeAll() {
     const handler = (r) => {
       c.value = r?.value ?? '';
       c.count++;
-      log(`NOTIFY ${label(c.uuid)} = ${hexSp(c.value) || '(empty)'}  |${ascii(c.value)}|`);
+      note(c, 'notify', c.value);
+      log(`BIKE NOTIFY ${label(c.uuid)} = ${hexSp(c.value) || '(empty)'}  |${ascii(c.value)}|`);
     };
     // iOS names the event with its own spelling of the ids (short form for standard ones).
     for (const k of new Set([`${c.svc}|${c.uuid}`, `${short(c.svc)}|${short(c.uuid)}`])) {
@@ -242,26 +329,84 @@ async function subscribeAll() {
   }
 }
 
-/* ---------- GPS alongside (also keeps the app running when the screen is locked) ---------- */
+/* ---------- phone GPS (also keeps the app running when the screen is locked) ---------- */
 
 function startGps() {
   stopGps();
   gpsWatch = watchPosition(
     (p) => {
-      const kmh = p.coords.speed != null && p.coords.speed >= 0 ? p.coords.speed * 3.6 : null;
-      S.speed = kmh;
+      const c = p.coords;
+      const kmh = c.speed != null && c.speed >= 0 ? c.speed * 3.6 : null;
+      S.gps = { lat: c.latitude, lon: c.longitude, alt: c.altitude, kmh, heading: c.heading, acc: c.accuracy };
       const now = Date.now();
-      if (now - lastGpsLog >= 3000) {
+      if (now - lastGpsLog >= 2000) {
         lastGpsLog = now;
-        log(`GPS speed ${kmh == null ? '?' : kmh.toFixed(1)} km/h (accuracy ${Math.round(p.coords.accuracy)} m)`);
+        log(`PHONE GPS lat ${f(c.latitude, 6)} lon ${f(c.longitude, 6)} alt ${f(c.altitude, 0)} m, speed ${f(kmh)} km/h, heading ${f(c.heading, 0)}°, accuracy ${f(c.accuracy, 0)} m`);
       }
     },
-    (e) => log(`GPS unavailable (code ${e.code}). Capture continues without speed.`)
+    (e) => log(`PHONE GPS unavailable (code ${e.code}). Capture continues without it.`)
   );
 }
 function stopGps() {
   if (gpsWatch != null) clearWatch(gpsWatch);
   gpsWatch = null;
+}
+
+/* ---------- phone motion sensors ---------- */
+// iPhone only allows these after a tap in the app, so permission is asked on the first tap
+// anywhere; after that they are logged automatically (averages and peaks every 2 s).
+
+let mo = null;
+let motionTimer = null;
+const resetMo = () => ({ n: 0, ax: 0, ay: 0, az: 0, peakG: 0, rot: 0, beta: null, gamma: null, alpha: null });
+
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity, la = e.acceleration, r = e.rotationRate;
+  if (!a || a.x == null) return;
+  S.motion = true;
+  mo.n++; mo.ax += a.x; mo.ay += a.y; mo.az += a.z;
+  if (la && la.x != null) mo.peakG = Math.max(mo.peakG, Math.hypot(la.x, la.y, la.z) / 9.81);
+  if (r && r.alpha != null) mo.rot = Math.max(mo.rot, Math.hypot(r.alpha, r.beta, r.gamma));
+}
+function onOrient(e) {
+  if (e.beta == null) return;
+  mo.beta = e.beta; mo.gamma = e.gamma; mo.alpha = e.alpha;
+}
+function flushMotion() {
+  if (!mo || !mo.n) return;
+  const n = mo.n;
+  log(`PHONE MOTION tilt fwd ${f(mo.beta, 0)}° side ${f(mo.gamma, 0)}° compass ${f(mo.alpha, 0)}°, ` +
+    `gravity x ${f(mo.ax / n, 2)} y ${f(mo.ay / n, 2)} z ${f(mo.az / n, 2)} m/s², peak ${f(mo.peakG, 2)} g, peak turn ${f(mo.rot, 0)}°/s`);
+  mo = resetMo();
+}
+function startMotion() {
+  mo = resetMo();
+  window.addEventListener('devicemotion', onMotion);
+  window.addEventListener('deviceorientation', onOrient);
+  clearInterval(motionTimer);
+  motionTimer = setInterval(flushMotion, 2000);
+}
+function stopMotion() {
+  window.removeEventListener('devicemotion', onMotion);
+  window.removeEventListener('deviceorientation', onOrient);
+  clearInterval(motionTimer);
+  motionTimer = null;
+}
+/** Asks for motion-sensor access; must run inside a tap. */
+export function askMotion() {
+  const asks = [window.DeviceMotionEvent, window.DeviceOrientationEvent]
+    .filter((E) => E && typeof E.requestPermission === 'function')
+    .map((E) => E.requestPermission().catch(() => 'denied'));
+  return Promise.all(asks).then((r) => {
+    const ok = r.every((x) => x === 'granted');
+    log(`Motion sensors ${ok ? 'allowed' : 'not allowed'}.`);
+    return ok;
+  });
+}
+function askMotionOnFirstTap() {
+  if (!window.DeviceMotionEvent?.requestPermission) return;
+  const once = () => { document.removeEventListener('touchend', once, true); if (!S.motion) askMotion(); };
+  document.addEventListener('touchend', once, true);
 }
 
 /* ---------- upload to the sync gist ---------- */
@@ -311,11 +456,13 @@ export async function startBikeCapture() {
   if (!BLE || started) return;
   started = true;
   S.log = (await db.kvGet(LOG_KEY, [])) || [];
+  S.stats = (await db.kvGet(STATS_KEY, {})) || {};
   skip = new Set((await db.kvGet(SKIP_KEY, [])) || []);
   S.auto = await db.kvGet(AUTO_KEY, true);
   S.gistId = (await getSync().catch(() => ({}))).gistId || null;
   setInterval(() => upload(), 120000);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') upload(); });
+  askMotionOnFirstTap();
   if (!S.auto) return;
   if (!(await init())) return;
   log('App opened: looking for the bike.');

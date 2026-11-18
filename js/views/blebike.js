@@ -1,7 +1,7 @@
 // Bike Bluetooth: shows the automatic capture from the bike's Bluetooth unit (see ../bikeble.js).
 // Nothing needs to be done here; the screen is for checking it works and sharing the log by hand.
 import { esc, icon, toast, shareFile, fmtTime } from '../ui.js';
-import { BLE, S, label, hexSp, ascii, logText, clearLog, readAll, setAuto, upload } from '../bikeble.js';
+import { BLE, S, label, hexSp, ascii, logText, clearLog, readAll, setAuto, upload, summaryText, lockedCount, askMotion } from '../bikeble.js';
 
 export const title = 'Bike Bluetooth';
 
@@ -29,9 +29,27 @@ function draw(el) {
       <div class="row head"><h2>${S.phase === 'connected' ? esc(S.dev.name) : 'Automatic capture'}</h2><span class="chip ${cls}">${st}</span></div>
       <label class="check"><input type="checkbox" data-act="auto" ${S.auto ? 'checked' : ''}><span>Capture from the bike automatically</span></label>
       <p class="muted small" style="margin-top:8px">Nothing to do: keep Bluetooth on and open Connect Bike when you get on the bike, with the ignition on.
-        It connects by itself, records everything the bike sends together with GPS speed, keeps going with the screen locked,
-        reconnects next time, and uploads the log to your cloud backup. It only reads; it never changes anything on the bike.</p>
-      ${S.phase === 'connected' ? `<p class="small" style="margin-top:8px">GPS speed: <b>${S.speed == null ? '—' : S.speed.toFixed(0) + ' km/h'}</b></p>` : ''}
+        It connects by itself and records everything the bike offers, together with the phone's own GPS and motion sensors, keeps going with
+        the screen locked, reconnects next time, and uploads the log to your cloud backup. It only reads; it never changes anything on the bike.
+        Tip: keep Honda's app running too. Anything the bike sends to it is captured here as well.</p>
+    </div>
+
+    <div class="card">
+      <h2>Phone readings</h2>
+      <dl class="kv">
+        <dt>Bike signal</dt><dd>${S.rssi == null ? '—' : S.rssi + ' dBm'}</dd>
+        <dt>Location</dt><dd>${S.gps ? `${S.gps.lat.toFixed(5)}, ${S.gps.lon.toFixed(5)} (±${Math.round(S.gps.acc)} m)` : '—'}</dd>
+        <dt>Speed</dt><dd>${S.gps?.kmh == null ? '—' : S.gps.kmh.toFixed(0) + ' km/h'}</dd>
+        <dt>Altitude</dt><dd>${S.gps?.alt == null ? '—' : Math.round(S.gps.alt) + ' m'}</dd>
+        <dt>Motion sensors</dt><dd>${S.motion ? 'Recording' : '<button class="btn sm" data-act="motion">Allow</button>'}</dd>
+      </dl>
+      <p class="muted small" style="margin-top:8px">These come from the iPhone, not the bike. They are logged next to the bike data so changes can be matched.</p>
+    </div>
+
+    <div class="card">
+      <div class="row head"><h2>What the bike gives</h2>${lockedCount() ? `<button class="btn sm" data-act="locked">Try ${lockedCount()} locked</button>` : ''}</div>
+      <pre class="small" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:45vh;overflow:auto;margin:0">${esc(summaryText())}</pre>
+      ${lockedCount() ? '<p class="muted small" style="margin-top:8px">Locked values need the phone to be paired with the bike. "Try" may show an iPhone pairing request.</p>' : ''}
     </div>
 
     <div class="card">
@@ -60,7 +78,7 @@ function draw(el) {
       <pre class="small" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:50vh;overflow:auto;margin:0">${esc(S.log.slice(-150).join('\n')) || 'Nothing yet.'}</pre>
     </div>
   `;
-  const pre = el.querySelector('pre');
+  const pre = [...el.querySelectorAll('pre')].pop();
   if (pre) pre.scrollTop = pre.scrollHeight;
 }
 
@@ -81,6 +99,8 @@ export async function render(el) {
     if (!t) return;
     switch (t.dataset.act) {
       case 'read': readAll('manual'); break;
+      case 'locked': readAll('locked values', true); break;
+      case 'motion': askMotion(); break;
       case 'upload': await upload(true); toast(S.lastUpload?.ok ? 'Log uploaded' : 'Upload failed: ' + (S.lastUpload?.msg || '')); break;
       case 'copyid':
         try { await navigator.clipboard.writeText(S.gistId); toast('Copied'); } catch { toast('Press and hold the id to copy it.'); }
