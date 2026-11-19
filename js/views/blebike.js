@@ -1,7 +1,7 @@
 // Bike Bluetooth: shows the automatic capture from the bike's Bluetooth unit (see ../bikeble.js).
 // Nothing needs to be done here; the screen is for checking it works and sharing the log by hand.
 import { esc, icon, toast, shareFile, fmtTime } from '../ui.js';
-import { BLE, S, label, hexSp, ascii, logText, clearLog, readAll, setAuto, upload, summaryText, lockedCount, askMotion } from '../bikeble.js';
+import { BLE, S, label, hexSp, ascii, logText, clearLog, readAll, setAuto, upload, summaryText, lockedCount, askMotion, motionAllowed } from '../bikeble.js';
 
 export const title = 'Bike Bluetooth';
 
@@ -41,7 +41,7 @@ function draw(el) {
         <dt>Location</dt><dd>${S.gps ? `${S.gps.lat.toFixed(5)}, ${S.gps.lon.toFixed(5)} (±${Math.round(S.gps.acc)} m)` : '—'}</dd>
         <dt>Speed</dt><dd>${S.gps?.kmh == null ? '—' : S.gps.kmh.toFixed(0) + ' km/h'}</dd>
         <dt>Altitude</dt><dd>${S.gps?.alt == null ? '—' : Math.round(S.gps.alt) + ' m'}</dd>
-        <dt>Motion sensors</dt><dd>${S.motion ? 'Recording' : '<button class="btn sm" data-act="motion">Allow</button>'}</dd>
+        <dt>Motion sensors</dt><dd>${S.motion ? 'Recording' : motionAllowed() ? 'Allowed (starts with the bike)' : '<button class="btn sm" data-act="motion">Allow</button>'}</dd>
       </dl>
       <p class="muted small" style="margin-top:8px">These come from the iPhone, not the bike. They are logged next to the bike data so changes can be matched.</p>
     </div>

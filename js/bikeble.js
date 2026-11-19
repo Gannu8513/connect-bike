@@ -35,7 +35,6 @@ export const hexSp = (h) => (h || '').replace(/(..)/g, '$1 ').trim();
 export const ascii = (h) => (h || '').replace(/(..)/g, (b) => { const c = parseInt(b, 16); return c >= 32 && c < 127 ? String.fromCharCode(c) : '.'; });
 const errText = (e) => String(e?.message || e || 'unknown error');
 const stamp = () => { const d = new Date(); return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0'); };
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const f = (n, d = 1) => (n == null || Number.isNaN(n) ? '?' : Number(n).toFixed(d));
 
 /** Shared state, read by the Bike Bluetooth screen. */
@@ -64,6 +63,13 @@ let lastGpsLog = 0;
 let uploadedLen = -1;
 let skip = new Set();
 let busyConnect = false;
+let searchTimer = null;
+
+/** Schedules the next search. Only one is ever pending, so retries cannot pile up. */
+function scheduleSearch(ms) {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { searchTimer = null; startSearch(); }, ms);
+}
 
 const changed = () => window.dispatchEvent(new Event('ble:changed'));
 
@@ -137,7 +143,9 @@ export function logText() {
 /* ---------- finding the bike ---------- */
 
 async function startSearch() {
-  if (!S.auto || S.phase === 'connected' || S.phase === 'connecting') return;
+  if (!S.auto || busyConnect || S.phase === 'connected' || S.phase === 'connecting') return;
+  clearTimeout(searchTimer);
+  searchTimer = null;
   S.phase = 'searching';
   changed();
   try {
@@ -151,6 +159,9 @@ async function startSearch() {
         connect(id, r.localName || r.device.name);
       });
     }
+    // The plugin answers a second scan request by stopping the scan altogether ("Already
+    // scanning"), so always stop any earlier scan first.
+    await BLE.stopLEScan().catch(() => {});
     // Filtering on Honda's service lets iOS keep scanning even in the background.
     await BLE.requestLEScan({ services: [HONDA_SERVICE], allowDuplicates: false });
   } catch (e) {
@@ -192,7 +203,7 @@ async function connect(deviceId, name) {
   log(`===== Connecting to ${S.dev.name} =====`);
   try {
     connListeners.push(await BLE.addListener(`disconnected|${deviceId}`, onDisconnected));
-    await BLE.connect({ deviceId, timeout: 20000 });
+    await BLE.connect({ deviceId, timeout: 12000 });
     S.phase = 'connected';
     log('Connected.');
     try { log(`BIKE MTU ${(await BLE.getMtu({ deviceId })).value}`); } catch { /* not important */ }
@@ -206,10 +217,12 @@ async function connect(deviceId, name) {
         S.chars.push({ svc: s.uuid, uuid: c.uuid, props: c.properties, descriptors: c.descriptors || [], value: null, count: 0, err: null, desc: {} });
       }
     }
+    // Listen first: the bike sends a burst of messages as soon as listening starts, and
+    // reading everything beforehand would delay that.
+    await subscribeAll();
     await readDescriptors();
     if (skip.size) log(`Not reading ${skip.size} locked value(s) found earlier, to avoid pairing prompts.`);
     await readAll('first read');
-    await subscribeAll();
     log('Capturing everything. Values re-read every 2 s (only changes logged), signal every 5 s, GPS and motion every 2 s.');
     pollTimer = setInterval(() => readAll('auto'), 2000);
     rssiTimer = setInterval(readRssi, 5000);
@@ -219,7 +232,7 @@ async function connect(deviceId, name) {
     log('Connect failed: ' + errText(e) + '. Will try again.');
     await BLE.disconnect({ deviceId }).catch(() => {});
     await endSession();
-    setTimeout(startSearch, 10000);
+    scheduleSearch(3000);
   } finally {
     busyConnect = false;
     changed();
@@ -227,10 +240,17 @@ async function connect(deviceId, name) {
 }
 
 async function onDisconnected() {
+  // iOS sometimes reports a disconnect while a connection is still being set up (seen when
+  // Honda's app already holds the bike). Ending the session then broke the attempt in progress
+  // and started a second search next to it; the attempt now finishes or times out on its own.
+  if (S.phase !== 'connected') {
+    log('(disconnect message while still connecting: ignored, the connection attempt carries on)');
+    return;
+  }
   log('===== Bike disconnected (ignition off or out of range). Waiting for it to come back. =====');
   await endSession();
   upload();
-  setTimeout(startSearch, 3000);
+  scheduleSearch(3000);
 }
 
 async function endSession() {
@@ -392,22 +412,34 @@ function stopMotion() {
   clearInterval(motionTimer);
   motionTimer = null;
 }
+let motionOk = false;
 /** Asks for motion-sensor access; must run inside a tap. */
 export function askMotion() {
   const asks = [window.DeviceMotionEvent, window.DeviceOrientationEvent]
     .filter((E) => E && typeof E.requestPermission === 'function')
-    .map((E) => E.requestPermission().catch(() => 'denied'));
+    .map((E) => E.requestPermission().catch((e) => 'error: ' + errText(e)));
   return Promise.all(asks).then((r) => {
     const ok = r.every((x) => x === 'granted');
-    log(`Motion sensors ${ok ? 'allowed' : 'not allowed'}.`);
+    if (ok !== motionOk || !ok) log(`Motion sensors ${ok ? 'allowed' : 'not allowed (' + r.join(', ') + '); will ask again on the next tap'}.`);
+    motionOk = ok;
+    changed();
     return ok;
   });
 }
-function askMotionOnFirstTap() {
-  if (!window.DeviceMotionEvent?.requestPermission) return;
-  const once = () => { document.removeEventListener('touchend', once, true); if (!S.motion) askMotion(); };
-  document.addEventListener('touchend', once, true);
+/** The app grants motion access itself, but iOS only lets the page ask during a real tap
+ *  (a scroll does not count), so keep asking on taps until it is granted. */
+function askMotionOnTaps() {
+  if (!window.DeviceMotionEvent?.requestPermission) { motionOk = true; return; }
+  let lastAsk = 0;
+  const onTap = () => {
+    if (motionOk) { document.removeEventListener('click', onTap, true); return; }
+    if (Date.now() - lastAsk < 5000) return;
+    lastAsk = Date.now();
+    askMotion();
+  };
+  document.addEventListener('click', onTap, true);
 }
+export const motionAllowed = () => motionOk;
 
 /* ---------- upload to the sync gist ---------- */
 
@@ -442,9 +474,10 @@ export async function upload(force = false) {
 export async function setAuto(on) {
   S.auto = on;
   await db.kvSet(AUTO_KEY, on);
-  if (on) { log('Automatic capture switched ON.'); if (await init()) startSearch(); }
+  if (on) { log('Automatic capture switched ON.'); if (await init()) scheduleSearch(0); }
   else {
     log('Automatic capture switched OFF.');
+    clearTimeout(searchTimer);
     await stopSearch();
     if (S.dev && S.phase !== 'off') await BLE.disconnect({ deviceId: S.dev.deviceId }).catch(() => {});
     await endSession();
@@ -462,12 +495,11 @@ export async function startBikeCapture() {
   S.gistId = (await getSync().catch(() => ({}))).gistId || null;
   setInterval(() => upload(), 120000);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') upload(); });
-  askMotionOnFirstTap();
+  askMotionOnTaps();
   if (!S.auto) return;
   if (!(await init())) return;
   log('App opened: looking for the bike.');
-  await wait(500);
-  startSearch();
+  scheduleSearch(500);
 }
 
 let ready = false;
